@@ -1,8 +1,11 @@
 // markdown-parser/src/lib.rs — tree-sitter Markdown parser WASM plugin for Basalt
+//
+// The host must call basalt_src_ptr() / basalt_out_ptr() after instantiation
+// to obtain the linear-memory addresses to write/read.
 
 use tree_sitter::{Language, Parser, Query, QueryCursor};
 
-const SRC_OFFSET: usize = 1 * 1024 * 1024;
+const SRC_OFFSET: usize = 0;
 const OUT_OFFSET: usize = 6 * 1024 * 1024;
 const MEMORY_BYTES: usize = 12 * 1024 * 1024;
 
@@ -17,9 +20,66 @@ static LANG_EXT: &[u8] = b"md\0";
 
 extern "C" { fn tree_sitter_markdown() -> Language; }
 
+// ---------------------------------------------------------------------------
+// Static parser + query cache (WASM is single-threaded; safe to use static mut)
+// ---------------------------------------------------------------------------
+
+struct ParserState {
+    parser: Parser,
+    parse_query: Query,
+    retrieval_query: Query,
+    parse_cap_names: Vec<String>,
+    retrieval_cap_names: Vec<String>,
+}
+
+static mut STATE: Option<ParserState> = None;
+
+unsafe fn get_state() -> Option<&'static mut ParserState> {
+    if STATE.is_none() {
+        let lang = tree_sitter_markdown();
+        let mut parser = Parser::new();
+        parser.set_language(lang).ok()?;
+
+        let parse_query_src = r#"
+            (atx_heading) @keyword
+            (fenced_code_block) @string
+            (block_quote) @comment
+        "#;
+        let parse_query = Query::new(lang, parse_query_src).ok()?;
+        let parse_cap_names: Vec<String> = parse_query.capture_names().iter().map(|s| s.to_string()).collect();
+
+        let retrieval_query_src = r#"(atx_heading (atx_h1_marker) heading_content: (_) @name.module) @chunk.module
+                       (atx_heading (atx_h2_marker) heading_content: (_) @name.module) @chunk.module
+                       (atx_heading (atx_h3_marker) heading_content: (_) @name.function) @chunk.function"#;
+        let retrieval_query = Query::new(lang, retrieval_query_src).ok()?;
+        let retrieval_cap_names: Vec<String> = retrieval_query.capture_names().iter().map(|s| s.to_string()).collect();
+
+        STATE = Some(ParserState {
+            parser,
+            parse_query,
+            retrieval_query,
+            parse_cap_names,
+            retrieval_cap_names,
+        });
+    }
+    STATE.as_mut()
+}
+
+// ---------------------------------------------------------------------------
+
 #[no_mangle]
 pub extern "C" fn basalt_lang() -> i32 {
     LANG_EXT.as_ptr() as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn basalt_src_ptr() -> i32 {
+    MEMORY[SRC_OFFSET..].as_ptr() as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn basalt_out_ptr() -> i32 {
+    MEMORY[OUT_OFFSET..].as_ptr() as i32
 }
 
 #[no_mangle]
@@ -27,38 +87,26 @@ pub unsafe extern "C" fn basalt_parse(
     src_ptr: i32, src_len: i32, out_ptr: i32, max_spans: i32,
 ) -> i32 {
     let src = std::slice::from_raw_parts(
-        (MEMORY.as_ptr() as usize + src_ptr as usize) as *const u8,
+        src_ptr as usize as *const u8,
         src_len as usize,
     );
     let out = std::slice::from_raw_parts_mut(
-        (MEMORY.as_ptr() as usize + out_ptr as usize) as *mut u8,
+        out_ptr as usize as *mut u8,
         (max_spans as usize) * 12,
     );
 
-    let lang = tree_sitter_markdown();
-    let mut parser = Parser::new();
-    if parser.set_language(lang).is_err() { return 0; }
-    let Some(tree) = parser.parse(src, None) else { return 0; };
+    let state = match get_state() { Some(s) => s, None => return 0 };
+    state.parser.reset();
+    let Some(tree) = state.parser.parse(src, None) else { return 0 };
 
-    let query_src = r#"
-        (atx_heading) @keyword
-        (fenced_code_block) @string
-        (code_span) @string
-        (emphasis) @function
-        (strong_emphasis) @function
-        (link_text) @type
-        (block_quote) @comment
-    "#;
-    let Ok(query) = Query::new(lang, query_src) else { return 0; };
     let mut cursor = QueryCursor::new();
-    let matches = cursor.matches(&query, tree.root_node(), src);
-    let cap_names = query.capture_names().to_vec();
+    let matches = cursor.matches(&state.parse_query, tree.root_node(), src);
 
     let mut count = 0usize;
     for m in matches {
         for cap in m.captures {
             if count >= max_spans as usize { break; }
-            let scope_id = match cap_names[cap.index as usize].as_str() {
+            let scope_id = match state.parse_cap_names[cap.index as usize].as_str() {
                 "keyword"  => SCOPE_KEYWORD,
                 "string"   => SCOPE_STRING,
                 "function" => SCOPE_FUNCTION,
@@ -84,27 +132,20 @@ pub unsafe extern "C" fn basalt_retrieval_chunks(
     src_ptr: i32, src_len: i32, out_ptr: i32, max_chunks: i32,
 ) -> i32 {
     let src = std::slice::from_raw_parts(
-        (MEMORY.as_ptr() as usize + src_ptr as usize) as *const u8,
+        src_ptr as usize as *const u8,
         src_len as usize,
     );
     let out = std::slice::from_raw_parts_mut(
-        (MEMORY.as_ptr() as usize + out_ptr as usize) as *mut u8,
+        out_ptr as usize as *mut u8,
         (max_chunks as usize) * 104,
     );
 
-    let lang = tree_sitter_markdown();
-    let mut parser = Parser::new();
-    if parser.set_language(lang).is_err() { return 0; }
-    let Some(tree) = parser.parse(src, None) else { return 0; };
+    let state = match get_state() { Some(s) => s, None => return 0 };
+    state.parser.reset();
+    let Some(tree) = state.parser.parse(src, None) else { return 0 };
 
-    // Use ATX headings as retrieval chunks (h1–h6).
-    let query_src = r#"(atx_heading (atx_h1_marker) heading_content: (_) @name.module) @chunk.module
-                       (atx_heading (atx_h2_marker) heading_content: (_) @name.module) @chunk.module
-                       (atx_heading (atx_h3_marker) heading_content: (_) @name.function) @chunk.function"#;
-    let Ok(query) = Query::new(lang, query_src) else { return 0; };
     let mut cursor = QueryCursor::new();
-    let matches = cursor.matches(&query, tree.root_node(), src);
-    let cap_names = query.capture_names().to_vec();
+    let matches = cursor.matches(&state.retrieval_query, tree.root_node(), src);
 
     let mut count = 0usize;
     for m in matches {
@@ -114,7 +155,7 @@ pub unsafe extern "C" fn basalt_retrieval_chunks(
         let mut kind = None::<&str>;
         let mut name = None::<&str>;
         for cap in m.captures {
-            let cn = &cap_names[cap.index as usize];
+            let cn = &state.retrieval_cap_names[cap.index as usize];
             if let Some(k) = cn.strip_prefix("chunk.") {
                 offset = Some(cap.node.start_byte() as u32);
                 length = Some((cap.node.end_byte() - cap.node.start_byte()) as u32);

@@ -12,6 +12,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "basalt-plugin-parser-markdown"
+version = "0.1.0"
+dependencies = [
+ "tree-sitter",
+ "tree-sitter-md",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -26,14 +34,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "markdown-parser"
-version = "0.1.0"
-dependencies = [
- "tree-sitter",
- "tree-sitter-md",
-]
 
 [[package]]
 name = "memchr"
